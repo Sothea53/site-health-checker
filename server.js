@@ -1,3 +1,8 @@
+// Loads a .env file if present (silently does nothing if it isn't) — a
+// fallback for hosting panels where env vars can't be set through the
+// dashboard directly. Never overrides a real process.env value that's
+// already set some other way.
+import 'dotenv/config';
 import puppeteer from 'puppeteer';
 import express from 'express';
 import cron from 'node-cron';
