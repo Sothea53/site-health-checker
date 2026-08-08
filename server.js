@@ -1,0 +1,882 @@
+import puppeteer from 'puppeteer';
+import express from 'express';
+import cron from 'node-cron';
+import { kv } from './kv.js';
+
+// ---- Edit this list with your 20+ sites ----
+const SITES = [
+  'https://godital.com',
+  'https://caravanpp.com',
+  'https://palacegatepp.com',
+];
+
+const VIEWPORTS = {
+  desktop: { width: 1920, height: 1080, isMobile: false },
+  mobile: {
+    width: 390,
+    height: 844,
+    isMobile: true,
+    hasTouch: true,
+    userAgent:
+      'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+  },
+};
+
+const OVERFLOW_TOLERANCE_PX = 5;
+const NAV_TIMEOUT_MS = 25000;
+const REPORT_HISTORY_DAYS = 30;
+const SETTLE_DELAY_MS = 4000; // wait after scrolling, before checking images/overflow/screenshot
+
+// Diagnostic logging: prefixed + timestamped so `wrangler tail` output shows
+// exactly which awaited step a check is on when (if) it hangs. Remove/quiet
+// this once the root cause is confirmed.
+function diag(label, extra) {
+  const line = `[diag +${Date.now() % 100000}ms] ${label}`;
+  if (extra !== undefined) console.log(line, extra);
+  else console.log(line);
+}
+
+
+// Hard ceiling for an entire single-page check (nav + scroll + settle + checks + screenshot).
+// Guards against any single site hanging the whole batch, no matter what causes it.
+const PAGE_TIMEOUT_MS = NAV_TIMEOUT_MS + SETTLE_DELAY_MS + 15000;
+
+async function performPageChecks(page, url, vp, result) {
+  diag(`setViewport start`, url);
+  await page.setViewport({ width: vp.width, height: vp.height, isMobile: !!vp.isMobile, hasTouch: !!vp.hasTouch });
+  if (vp.userAgent) await page.setUserAgent(vp.userAgent);
+  diag(`setViewport done`, url);
+
+  page.on('console', (msg) => {
+    if (msg.type() === 'error') result.consoleErrors.push(msg.text().slice(0, 300));
+  });
+  page.on('pageerror', (err) => {
+    result.consoleErrors.push(`Uncaught exception: ${err.message}`.slice(0, 300));
+  });
+  page.on('requestfailed', (req) => {
+    const failure = req.failure();
+    if (failure && failure.errorText !== 'net::ERR_ABORTED') {
+      result.failedRequests.push(`${req.method()} ${req.url()} — ${failure.errorText}`);
+    }
+  });
+
+  const start = Date.now();
+  diag(`goto start`, url);
+  const response = await page.goto(url, { waitUntil: 'networkidle0', timeout: NAV_TIMEOUT_MS });
+  diag(`goto done`, `${url} status=${response ? response.status() : 'null'}`);
+  result.loadTimeMs = Date.now() - start;
+  result.httpStatus = response ? response.status() : null;
+
+  if (!response || response.status() >= 400) {
+    result.status = 'DOWN';
+    result.issues.push(`HTTP ${result.httpStatus ?? 'no response'}`);
+  }
+
+  // Scroll through the page to trigger lazy-loaded images (most lazy-load
+  // libraries only start loading once an element enters the viewport), then
+  // scroll back to top. Hard-capped by both distance and iteration count so
+  // infinite-scroll pages or content that keeps growing can't loop forever.
+  diag(`scroll evaluate start`, url);
+  await page.evaluate(async () => {
+    await new Promise((resolve) => {
+      let scrolled = 0;
+      let iterations = 0;
+      const step = 400;
+      const maxScroll = 20000;
+      const maxIterations = 60; // ~6s of stepping at 100ms, regardless of page height
+      const timer = setInterval(() => {
+        window.scrollBy(0, step);
+        scrolled += step;
+        iterations += 1;
+        const target = Math.min(document.body.scrollHeight, maxScroll);
+        if (scrolled >= target || iterations >= maxIterations) {
+          clearInterval(timer);
+          window.scrollTo(0, 0);
+          resolve();
+        }
+      }, 100);
+    });
+  });
+  diag(`scroll evaluate done`, url);
+  await new Promise((resolve) => setTimeout(resolve, SETTLE_DELAY_MS));
+  diag(`settle delay done`, url);
+
+  diag(`broken-images evaluate start`, url);
+  const brokenImages = await page.evaluate(() => {
+    return Array.from(document.querySelectorAll('img'))
+      .filter((img) => img.src && !img.src.startsWith('data:') && (!img.complete || img.naturalWidth === 0))
+      .map((img) => img.src)
+      .slice(0, 20);
+  });
+  diag(`broken-images evaluate done`, `${url} count=${brokenImages.length}`);
+  result.brokenImages = brokenImages;
+
+  diag(`overflow evaluate start`, url);
+  const overflow = await page.evaluate(() => {
+    const docWidth = document.documentElement.scrollWidth;
+    const viewWidth = document.documentElement.clientWidth;
+    return { docWidth, viewWidth };
+  });
+  diag(`overflow evaluate done`, url);
+  result.hasOverflow = overflow.docWidth > overflow.viewWidth + OVERFLOW_TOLERANCE_PX;
+  if (result.hasOverflow) {
+    result.issues.push(`Horizontal overflow: page is ${overflow.docWidth}px wide in a ${overflow.viewWidth}px viewport`);
+  }
+
+  if (brokenImages.length > 0) result.issues.push(`${brokenImages.length} broken image(s)`);
+  if (result.consoleErrors.length > 0) result.issues.push(`${result.consoleErrors.length} console error(s)`);
+  if (result.failedRequests.length > 0) result.issues.push(`${result.failedRequests.length} failed network request(s)`);
+
+  if (result.status === 'OK' && result.issues.length > 0) result.status = 'ISSUES';
+
+  // Only screenshot pages with an issue, to stay well within the Free plan's 10 min/day browser budget
+  if (result.issues.length > 0) {
+    diag(`screenshot start`, url);
+    result.screenshotBytes = await page.screenshot({ fullPage: true });
+    diag(`screenshot done`, url);
+  }
+  diag(`performPageChecks complete`, url);
+}
+
+async function checkPage(browser, url, viewportName, vp) {
+  diag(`newPage start`, `${url} [${viewportName}]`);
+  const page = await browser.newPage();
+  diag(`newPage done`, `${url} [${viewportName}]`);
+  const result = {
+    url,
+    viewport: viewportName,
+    status: 'OK',
+    httpStatus: null,
+    issues: [],
+    consoleErrors: [],
+    failedRequests: [],
+    brokenImages: [],
+    hasOverflow: false,
+    loadTimeMs: null,
+    screenshotId: null,
+    checkedAt: new Date().toISOString(),
+  };
+
+  // Promise.race below does NOT cancel performPageChecks if the timeout
+  // branch wins — it keeps running in the background against a page we're
+  // about to close. When it then throws (operating on a closed page), that
+  // rejection has nothing attached to catch it, which crashes the whole
+  // background run (ctx.waitUntil) silently with no log line — this is what
+  // was killing the run dead right after the first slow/hanging page.
+  const checkPromise = performPageChecks(page, url, vp, result);
+  checkPromise.catch(() => {});
+
+  try {
+    await Promise.race([
+      checkPromise.then(() => diag(`race: performPageChecks won`, `${url} [${viewportName}]`)),
+      new Promise((_, reject) =>
+        setTimeout(() => {
+          diag(`race: timeout won — performPageChecks still pending`, `${url} [${viewportName}]`);
+          reject(new Error(`Check exceeded ${PAGE_TIMEOUT_MS}ms overall timeout`));
+        }, PAGE_TIMEOUT_MS)
+      ),
+    ]);
+  } catch (err) {
+    diag(`checkPage caught error`, `${url} [${viewportName}] ${String(err && err.message ? err.message : err)}`);
+    result.status = 'DOWN';
+    result.issues.push(`Failed to load: ${String(err.message).split('\n')[0]}`);
+  } finally {
+    diag(`page.close start`, `${url} [${viewportName}]`);
+    await page.close().catch(() => {});
+    diag(`page.close done`, `${url} [${viewportName}]`);
+  }
+
+  return result;
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function statusClass(status) {
+  return status === 'DOWN' ? 'down' : status === 'ISSUES' ? 'warn' : 'ok';
+}
+
+const DISPLAY_TIMEZONE = 'Asia/Phnom_Penh';
+
+// Timestamps are stored/keyed in UTC ISO (so KV keys stay sortable and
+// unambiguous); this only affects how they're rendered to the user.
+function formatDisplayTime(isoOrDate) {
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: DISPLAY_TIMEZONE,
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(new Date(isoOrDate)).replace(',', '') + ' ICT';
+}
+
+// Shared look across both pages: a dark diagnostics-console aesthetic —
+// status dots, monospace vitals, red/amber/green semantics borrowed from
+// real monitoring equipment rather than a generic light dashboard.
+const BASE_STYLES = `
+  :root {
+    --bg: #0d1117;
+    --border: #262c34;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --text-faint: #565f6b;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --down: #f85149;
+    --accent: #58a6ff;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text); font-family: var(--sans);
+    margin: 0; padding: 0 0 64px; -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); }
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 28px; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; background: rgba(13,17,23,0.92); backdrop-filter: blur(6px);
+    z-index: 10;
+  }
+  .brand {
+    font-family: var(--mono); font-size: 12.5px; font-weight: 600; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--text-dim);
+  }
+  .brand strong { color: var(--text); }
+  .nav a {
+    color: var(--text-dim); text-decoration: none; font-size: 12.5px; margin-left: 22px;
+    font-family: var(--mono); letter-spacing: 0.04em;
+  }
+  .nav a:hover { color: var(--accent); }
+  .nav .check-now {
+    margin-left: 22px; color: var(--bg); background: var(--accent);
+    padding: 5px 12px; border-radius: 5px; font-weight: 600;
+    transition: opacity 0.15s ease;
+  }
+  .nav .check-now:hover { color: var(--bg); opacity: 0.85; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; display: inline-block; }
+  .dot--ok { background: var(--ok); }
+  .dot--warn { background: var(--warn); }
+  .dot--down {
+    background: var(--down);
+    animation: pulse 1.8s ease-out infinite;
+  }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(248,81,73,0.45); }
+    70% { box-shadow: 0 0 0 8px rgba(248,81,73,0); }
+    100% { box-shadow: 0 0 0 0 rgba(248,81,73,0); }
+  }
+  .badge {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.06em; padding: 2px 8px;
+    border-radius: 4px; text-transform: uppercase; font-weight: 700;
+  }
+  .badge--ok { color: var(--ok); background: rgba(63,185,80,0.12); }
+  .badge--warn { color: var(--warn); background: rgba(210,153,34,0.12); }
+  .badge--down { color: var(--down); background: rgba(248,81,73,0.12); }
+`;
+
+function topbar(activeNav) {
+  return `
+  <div class="topbar">
+    <div class="brand"><strong>Site Health</strong> · console</div>
+    <div class="nav">
+      <a href="/" ${activeNav === 'latest' ? 'style="color:var(--accent)"' : ''}>Latest</a>
+      <a href="/history" ${activeNav === 'history' ? 'style="color:var(--accent)"' : ''}>History</a>
+      <a href="/run" class="check-now">Check Now</a>
+    </div>
+  </div>`;
+}
+
+function generateHtmlReport(results, timestampIso, options = {}) {
+  const { isHistorical = false } = options;
+
+  const bySite = {};
+  for (const r of results) {
+    bySite[r.url] = bySite[r.url] || [];
+    bySite[r.url].push(r);
+  }
+
+  const summaryPatterns = [/console error/, /failed network request/, /broken image/];
+
+  const rows = Object.entries(bySite)
+    .map(([siteUrl, entries]) => {
+      const worst = entries.some((e) => e.status === 'DOWN')
+        ? 'DOWN'
+        : entries.some((e) => e.status === 'ISSUES')
+        ? 'ISSUES'
+        : 'OK';
+      const worstClass = statusClass(worst);
+
+      const viewportBlocks = entries
+        .map((e) => {
+          const cls = statusClass(e.status);
+          const flagIssues = e.issues.filter((i) => !summaryPatterns.some((p) => p.test(i)));
+
+          const details = [];
+
+          if (flagIssues.length > 0) {
+            details.push(
+              flagIssues.map((i) => `<div class="flag flag--${cls}">${escapeHtml(i)}</div>`).join('')
+            );
+          }
+          if (e.consoleErrors.length > 0) {
+            details.push(`
+              <details class="detail">
+                <summary>${e.consoleErrors.length} console error${e.consoleErrors.length > 1 ? 's' : ''}</summary>
+                <div class="detail-body"><ul class="detail-list">${e.consoleErrors
+                  .map((m) => `<li>${escapeHtml(m)}</li>`)
+                  .join('')}</ul></div>
+              </details>`);
+          }
+          if (e.failedRequests.length > 0) {
+            details.push(`
+              <details class="detail">
+                <summary>${e.failedRequests.length} failed request${e.failedRequests.length > 1 ? 's' : ''}</summary>
+                <div class="detail-body"><ul class="detail-list">${e.failedRequests
+                  .map((m) => `<li>${escapeHtml(m)}</li>`)
+                  .join('')}</ul></div>
+              </details>`);
+          }
+          if (e.brokenImages.length > 0) {
+            details.push(`
+              <details class="detail">
+                <summary>${e.brokenImages.length} broken image${e.brokenImages.length > 1 ? 's' : ''}</summary>
+                <div class="detail-body"><ul class="detail-list">${e.brokenImages
+                  .map((m) => `<li><a href="${escapeHtml(m)}" target="_blank">${escapeHtml(m)}</a></li>`)
+                  .join('')}</ul></div>
+              </details>`);
+          }
+          if (e.screenshotId) {
+            details.push(`
+              <details class="detail">
+                <summary>Screenshot</summary>
+                <div class="detail-body"><img class="detail-shot" loading="lazy" src="/screenshot/${e.screenshotId}" /></div>
+              </details>`);
+          }
+
+          return `
+            <div class="viewport-row">
+              <div class="viewport-head">
+                <span class="dot dot--${cls}"></span>
+                <span class="viewport-name">${e.viewport}</span>
+                <span class="badge badge--${cls}">${e.status}</span>
+                <span class="viewport-meta">HTTP ${e.httpStatus ?? '—'} · ${e.loadTimeMs ?? '—'}ms</span>
+              </div>
+              ${details.join('')}
+            </div>`;
+        })
+        .join('');
+
+      return `
+        <div class="site-row">
+          <div class="site-head">
+            <span class="dot dot--${worstClass}"></span>
+            <a class="site-url" href="${siteUrl}" target="_blank">${escapeHtml(siteUrl)}</a>
+            <span class="badge badge--${worstClass} site-badge">${worst}</span>
+          </div>
+          <div class="viewports">${viewportBlocks}</div>
+        </div>`;
+    })
+    .join('');
+
+  const downCount = Object.values(bySite).filter((e) => e.some((x) => x.status === 'DOWN')).length;
+  const issueCount = Object.values(bySite).filter(
+    (e) => !e.some((x) => x.status === 'DOWN') && e.some((x) => x.status === 'ISSUES')
+  ).length;
+  const okCount = Object.keys(bySite).length - downCount - issueCount;
+
+  const subtitle = isHistorical
+    ? `Archived report · ${formatDisplayTime(timestampIso)}`
+    : `Live report · ${formatDisplayTime(timestampIso)}`;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Site Health Report</title>
+<style>
+${BASE_STYLES}
+  .vitals {
+    display: flex; gap: 30px; align-items: baseline; flex-wrap: wrap;
+    padding: 26px 28px 20px; border-bottom: 1px solid var(--border);
+  }
+  .vital { display: flex; align-items: baseline; gap: 8px; }
+  .vital-num { font-family: var(--mono); font-size: 30px; font-weight: 700; }
+  .vital-label { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-dim); }
+  .vital--ok .vital-num { color: var(--ok); }
+  .vital--warn .vital-num { color: var(--warn); }
+  .vital--down .vital-num { color: var(--down); }
+  .vitals-meta { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--text-faint); align-self: center; }
+
+  .list { padding: 6px 28px 0; max-width: 920px; }
+  .site-row { border-bottom: 1px solid var(--border); padding: 16px 0; }
+  .site-head { display: flex; align-items: center; gap: 10px; }
+  .site-url { color: var(--text); text-decoration: none; font-weight: 600; font-size: 14.5px; }
+  .site-url:hover { color: var(--accent); }
+  .site-badge { margin-left: auto; }
+
+  .viewports { margin: 10px 0 0 18px; display: flex; flex-direction: column; gap: 10px; }
+  .viewport-head { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+  .viewport-name { font-family: var(--mono); text-transform: uppercase; color: var(--text-dim); width: 60px; font-size: 11px; letter-spacing: 0.05em; }
+  .viewport-meta { color: var(--text-faint); font-family: var(--mono); font-size: 11.5px; }
+
+  .flag { margin: 6px 0 0 70px; font-size: 12.5px; color: var(--text-dim); font-family: var(--mono); }
+  .flag--down { color: var(--down); }
+  .flag--warn { color: var(--warn); }
+
+  details.detail { margin: 6px 0 0 70px; }
+  details.detail summary { cursor: pointer; font-size: 12.5px; color: var(--text-dim); list-style: none; }
+  details.detail summary::-webkit-details-marker { display: none; }
+  details.detail summary::before { content: '▸ '; color: var(--text-faint); }
+  details.detail[open] summary::before { content: '▾ '; }
+  .detail-body { margin: 6px 0 4px 14px; }
+  .detail-list { margin: 0; padding-left: 16px; font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); }
+  .detail-list li { margin-bottom: 3px; word-break: break-all; }
+  .detail-list a { color: var(--text-dim); }
+  .detail-list a:hover { color: var(--accent); }
+  .detail-shot { max-width: 100%; margin-top: 6px; border: 1px solid var(--border); border-radius: 6px; display: block; }
+</style>
+</head>
+<body>
+  ${topbar('latest')}
+  <div class="vitals">
+    <div class="vital vital--ok"><span class="vital-num">${okCount}</span><span class="vital-label">up</span></div>
+    <div class="vital vital--warn"><span class="vital-num">${issueCount}</span><span class="vital-label">issues</span></div>
+    <div class="vital vital--down"><span class="vital-num">${downCount}</span><span class="vital-label">down</span></div>
+    <div class="vitals-meta">${subtitle}</div>
+  </div>
+  <div class="list">${rows}</div>
+</body>
+</html>`;
+}
+
+function generateHistoryListHtml(entries) {
+  // entries: [{ ts, summary: { okCount, issueCount, downCount, totalSites } | null }], newest first
+  const sorted = [...entries].sort((a, b) => (a.ts < b.ts ? 1 : -1));
+
+  const rows = sorted
+    .map(({ ts, summary }) => {
+      const label = formatDisplayTime(ts);
+      const counts = summary
+        ? `
+          <span class="hcount hcount--ok">${summary.okCount} up</span>
+          <span class="hcount hcount--warn">${summary.issueCount} issues</span>
+          <span class="hcount hcount--down">${summary.downCount} down</span>`
+        : `<span class="hcount">—</span>`;
+      return `
+        <a class="history-row" href="/history/${encodeURIComponent(ts)}">
+          <span class="history-time">${label}</span>
+          <span class="history-counts">${counts}</span>
+        </a>`;
+    })
+    .join('');
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Site Health — History</title>
+<style>
+${BASE_STYLES}
+  .list { padding: 10px 28px 0; max-width: 720px; }
+  .history-row {
+    display: flex; align-items: center; gap: 16px; padding: 14px 4px;
+    border-bottom: 1px solid var(--border); text-decoration: none; color: var(--text);
+  }
+  .history-row:hover .history-time { color: var(--accent); }
+  .history-time { font-family: var(--mono); font-size: 13px; flex: 1; }
+  .history-counts { display: flex; gap: 12px; }
+  .hcount { font-family: var(--mono); font-size: 11.5px; color: var(--text-faint); margin-left: 12px; }
+  .hcount:first-child { margin-left: 0; }
+  .hcount--ok { color: var(--ok); }
+  .hcount--warn { color: var(--warn); }
+  .hcount--down { color: var(--down); }
+  .empty-state { padding: 60px 28px; text-align: center; color: var(--text-faint); font-family: var(--mono); font-size: 13px; }
+</style>
+</head>
+<body>
+  ${topbar('history')}
+  <div class="list">${rows}</div>
+  ${rows ? '' : `<div class="empty-state">No past reports yet — reports are kept for ${REPORT_HISTORY_DAYS} days.</div>`}
+</body>
+</html>`;
+}
+
+function generateRunningPageHtml() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Site Health — Running…</title>
+<style>
+${BASE_STYLES}
+  .run-wrap { max-width: 640px; margin: 56px auto; padding: 0 24px; }
+  .run-head { display: flex; align-items: center; gap: 10px; margin-bottom: 22px; }
+  .dot--scan { background: var(--accent); animation: pulse-blue 1.4s ease-out infinite; }
+  @keyframes pulse-blue {
+    0% { box-shadow: 0 0 0 0 rgba(88,166,255,0.45); }
+    70% { box-shadow: 0 0 0 8px rgba(88,166,255,0); }
+    100% { box-shadow: 0 0 0 0 rgba(88,166,255,0); }
+  }
+  .run-title { font-family: var(--mono); font-size: 15px; letter-spacing: 0.03em; }
+  .progress-track { height: 6px; background: #1c222b; border-radius: 3px; overflow: hidden; margin-bottom: 10px; }
+  .progress-fill { height: 100%; width: 0%; background: var(--accent); transition: width 0.4s ease; }
+  .status-text { font-family: var(--mono); font-size: 12.5px; color: var(--text-dim); margin-bottom: 22px; }
+  .log { background: #0a0d12; border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; height: 280px; overflow-y: auto; font-family: var(--mono); font-size: 11.5px; }
+  .log-line { padding: 2px 0; color: var(--text-dim); }
+  .log-line--ok { color: var(--ok); }
+  .log-line--warn { color: var(--warn); }
+  .log-line--down { color: var(--down); }
+  .done-note { margin-top: 16px; font-family: var(--mono); font-size: 12.5px; color: var(--ok); display: none; }
+</style>
+</head>
+<body>
+  ${topbar('latest')}
+  <div class="run-wrap">
+    <div class="run-head">
+      <span class="dot dot--scan"></span>
+      <span class="run-title">Running health check…</span>
+    </div>
+    <div class="progress-track"><div class="progress-fill" id="bar"></div></div>
+    <div class="status-text" id="status-text">Starting…</div>
+    <div class="log" id="log"></div>
+    <div class="done-note" id="done-note">Done — redirecting to the report…</div>
+  </div>
+  <script>
+    var lastCount = 0;
+    function statusClassFor(s) { return s === 'DOWN' ? 'down' : s === 'ISSUES' ? 'warn' : 'ok'; }
+    function iconFor(s) { return s === 'DOWN' ? '✕' : s === 'ISSUES' ? '!' : '✓'; }
+
+    function poll() {
+      fetch('/run-status').then(function (res) { return res.json(); }).then(function (data) {
+        var total = data.total || 0;
+        var completed = data.completed || [];
+        var pct = total > 0 ? Math.round((completed.length / total) * 100) : 0;
+        document.getElementById('bar').style.width = pct + '%';
+        document.getElementById('status-text').textContent =
+          data.status === 'done'
+            ? 'Done — ' + completed.length + ' checks complete'
+            : 'Checking ' + completed.length + ' of ' + total + '…';
+
+        var log = document.getElementById('log');
+        for (var i = lastCount; i < completed.length; i++) {
+          var c = completed[i];
+          var line = document.createElement('div');
+          line.className = 'log-line log-line--' + statusClassFor(c.status);
+          line.textContent = iconFor(c.status) + ' ' + c.url + ' — ' + c.viewport + ' — ' + (c.loadTimeMs != null ? c.loadTimeMs + 'ms' : '—');
+          log.appendChild(line);
+        }
+        log.scrollTop = log.scrollHeight;
+        lastCount = completed.length;
+
+        if (data.status === 'done') {
+          document.getElementById('done-note').style.display = 'block';
+          setTimeout(function () { window.location.href = '/'; }, 1300);
+          return;
+        }
+        if (data.status === 'error') {
+          document.getElementById('status-text').textContent = 'Run failed: ' + (data.error || 'unknown error');
+          document.getElementById('status-text').style.color = 'var(--down)';
+          return;
+        }
+        setTimeout(poll, 900);
+      }).catch(function () {
+        setTimeout(poll, 1500);
+      });
+    }
+    poll();
+  </script>
+</body>
+</html>`;
+}
+
+async function runChecks() {
+  // Guard against overlapping runs: if a run is still marked 'running', a
+  // second trigger (a fast double-click on /run, or the cron firing mid-test)
+  // would launch a second browser session on top of the first — which is
+  // exactly what produces the 'Unable to create new browser: 429 rate limit'
+  // error, since the Free plan only allows a couple of concurrent sessions.
+  const existingRaw = await kv.get('run-status');
+  if (existingRaw) {
+    const existing = JSON.parse(existingRaw);
+    if (existing.status === 'running') {
+      const startedAt = existing.startedAt ? new Date(existing.startedAt).getTime() : 0;
+      const ageMs = Date.now() - startedAt;
+      // Treat a "running" run older than PAGE_TIMEOUT_MS * totalChecks as stale/dead
+      // rather than trusting it forever, in case a prior invocation was killed
+      // outright and never got to write an 'error' status.
+      const staleAfterMs = PAGE_TIMEOUT_MS * Math.max(existing.total || 1, 1) + 60000;
+      if (ageMs < staleAfterMs) {
+        diag(`runChecks skipped — a run is already in progress`, `startedAt=${existing.startedAt}`);
+        return null;
+      }
+      diag(`runChecks: previous run-status looked stale, proceeding anyway`, `ageMs=${ageMs}`);
+    }
+  }
+
+  const totalChecks = SITES.length * Object.keys(VIEWPORTS).length;
+  const progress = { status: 'running', total: totalChecks, completed: [], startedAt: new Date().toISOString() };
+  await kv.put('run-status', JSON.stringify(progress));
+
+  // Guard the whole run: without this, any unexpected failure (browser launch
+  // hanging, a KV write erroring, etc.) leaves run-status stuck on 'running'
+  // forever with no signal back to the polling UI, which is what made the
+  // progress bar appear to freeze. Now a failure is recorded and surfaced.
+  try {
+    return await runChecksInner( progress, totalChecks);
+  } catch (err) {
+    progress.status = 'error';
+    progress.error = String(err && err.message ? err.message : err);
+    progress.finishedAt = new Date().toISOString();
+    await kv.put('run-status', JSON.stringify(progress));
+    throw err;
+  }
+}
+
+// Self-hosted Chromium can still fail to launch transiently (OOM under load,
+// a zombie process still holding the profile lock, etc.) — retry a couple of
+// times with a short backoff before giving up for real.
+async function launchBrowserWithRetry(maxAttempts = 3) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      diag(`browser.launch attempt ${attempt} start`);
+      const browser = await puppeteer.launch({
+        headless: 'new',
+        // --no-sandbox is required on most bare Linux servers unless you've
+        // set up a dedicated unprivileged user + kernel namespaces for
+        // Chrome's sandbox. Safe here since we only ever navigate to a
+        // fixed, known list of URLs (see SITES above), not arbitrary input.
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+      });
+      diag(`browser.launch attempt ${attempt} done`);
+      return browser;
+    } catch (err) {
+      lastErr = err;
+      diag(`browser.launch attempt ${attempt} failed`, String(err && err.message ? err.message : err));
+      if (attempt === maxAttempts) break;
+      const waitSeconds = attempt * 5; // 5s, 10s
+      diag(`browser.launch retrying after ${waitSeconds}s`);
+      await new Promise((resolve) => setTimeout(resolve, waitSeconds * 1000));
+    }
+  }
+  throw lastErr;
+}
+
+async function runChecksInner( progress, totalChecks) {
+  const browser = await launchBrowserWithRetry();
+  const results = [];
+
+  try {
+    for (const siteUrl of SITES) {
+      for (const [name, vp] of Object.entries(VIEWPORTS)) {
+        diag(`checkPage call start`, `${siteUrl} [${name}]`);
+        let result;
+        try {
+          result = await checkPage(browser, siteUrl, name, vp);
+          diag(`checkPage call done`, `${siteUrl} [${name}] status=${result.status}`);
+        } catch (err) {
+          // Belt-and-braces: even if checkPage itself throws (e.g. browser.newPage()
+          // failing), don't let one bad check take the whole batch down with it.
+          diag(`checkPage threw`, `${siteUrl} [${name}] ${String(err && err.message ? err.message : err)}`);
+          result = {
+            url: siteUrl,
+            viewport: name,
+            status: 'DOWN',
+            issues: [`Check errored: ${String(err && err.message ? err.message : err).split('\n')[0]}`],
+            httpStatus: null,
+            consoleErrors: [],
+            failedRequests: [],
+            brokenImages: [],
+            hasOverflow: false,
+            loadTimeMs: null,
+            screenshotId: null,
+            checkedAt: new Date().toISOString(),
+          };
+        }
+        results.push(result);
+        progress.completed.push({ url: siteUrl, viewport: name, status: result.status, loadTimeMs: result.loadTimeMs });
+        diag(`KV run-status put start`, `${siteUrl} [${name}]`);
+        await kv.put('run-status', JSON.stringify(progress));
+        diag(`KV run-status put done`, `${siteUrl} [${name}]`);
+      }
+    }
+  } finally {
+    diag(`browser.close start`);
+    await browser.close().catch(() => {});
+    diag(`browser.close done`);
+  }
+
+  const timestampIso = new Date().toISOString();
+
+  // Store screenshots separately as raw bytes, served via their own URL — keeps
+  // report pages small and fast instead of embedding multi-MB base64 blobs inline.
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    if (r.screenshotBytes) {
+      const screenshotId = `${timestampIso}-${i}`;
+      await kv.put(`screenshot-${screenshotId}`, r.screenshotBytes, {
+        expirationTtl: 60 * 60 * 24 * REPORT_HISTORY_DAYS,
+      });
+      r.screenshotId = screenshotId;
+      delete r.screenshotBytes;
+    }
+  }
+
+  // Small summary record so the /history list can show counts per run
+  // without having to fetch and parse every full report.
+  const bySite = {};
+  for (const r of results) {
+    bySite[r.url] = bySite[r.url] || [];
+    bySite[r.url].push(r);
+  }
+  const downCount = Object.values(bySite).filter((e) => e.some((x) => x.status === 'DOWN')).length;
+  const issueCount = Object.values(bySite).filter(
+    (e) => !e.some((x) => x.status === 'DOWN') && e.some((x) => x.status === 'ISSUES')
+  ).length;
+  const okCount = Object.keys(bySite).length - downCount - issueCount;
+  await kv.put(
+    `summary-${timestampIso}`,
+    JSON.stringify({ okCount, issueCount, downCount, totalSites: Object.keys(bySite).length }),
+    { expirationTtl: 60 * 60 * 24 * REPORT_HISTORY_DAYS }
+  );
+
+  const html = generateHtmlReport(results, timestampIso);
+
+  await kv.put('latest-report-html', html);
+  await kv.put('latest-report-json', JSON.stringify(results));
+  await kv.put(`report-${timestampIso}`, JSON.stringify(results), {
+    expirationTtl: 60 * 60 * 24 * REPORT_HISTORY_DAYS,
+  });
+
+  progress.status = 'done';
+  progress.finishedAt = timestampIso;
+  await kv.put('run-status', JSON.stringify(progress));
+
+  return results;
+}
+
+// Equivalent of wrangler.toml's `[triggers] crons = ["0 0 * * *"]` (00:00
+// UTC = 07:00 Asia/Phnom_Penh) — expressed directly in local time here since
+// we're no longer forced to think in UTC the way Workers cron triggers do.
+// Override with the CRON_SCHEDULE / CRON_TIMEZONE env vars if needed.
+function setupCronSchedule() {
+  const schedule = process.env.CRON_SCHEDULE || '0 7 * * *';
+  const timezone = process.env.CRON_TIMEZONE || 'Asia/Phnom_Penh';
+  cron.schedule(
+    schedule,
+    () => {
+      diag('cron triggered runChecks');
+      runChecks().catch((err) => diag('cron runChecks unhandled rejection', String(err && err.message ? err.message : err)));
+    },
+    { timezone }
+  );
+  console.log(`Scheduled daily check: "${schedule}" (${timezone})`);
+}
+
+const app = express();
+
+// Express 4 does NOT automatically catch rejections from async route
+// handlers — an unhandled rejection here just leaves the request hanging
+// forever with no response and no visible error, which is exactly the
+// silent-hang failure mode this whole project already spent a long debugging
+// session chasing down on the Cloudflare version. Wrap every async handler
+// so failures (e.g. Mongo unreachable) turn into a real 500 response instead.
+function asyncHandler(fn) {
+  return (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
+app.get('/run', (req, res) => {
+  // Fire-and-forget, same as Cloudflare's ctx.waitUntil(runChecks()) — the
+  // Node process stays alive on its own (the HTTP server keeps the event
+  // loop running), so we don't need an equivalent of waitUntil here. Any
+  // failure is still caught and recorded by runChecks()'s own try/catch.
+  runChecks().catch((err) => diag('runChecks unhandled rejection', String(err && err.message ? err.message : err)));
+  res.type('html').send(generateRunningPageHtml());
+});
+
+// Synchronous JSON variant, useful for scripting/curl instead of the browser UI
+app.get('/run.json', asyncHandler(async (req, res) => {
+  const results = await runChecks();
+  if (results === null) {
+    return res.status(409).json({ ok: false, skipped: true, reason: 'A run is already in progress' });
+  }
+  const downCount = results.filter((r) => r.status === 'DOWN').length;
+  const issueCount = results.filter((r) => r.status === 'ISSUES').length;
+  res.json({ ok: true, checked: results.length, down: downCount, issues: issueCount });
+}));
+
+app.get('/run-status', asyncHandler(async (req, res) => {
+  const json = await kv.get('run-status');
+  res.set('cache-control', 'no-store').type('json').send(json || JSON.stringify({ status: 'idle', total: 0, completed: [] }));
+}));
+
+app.get('/report.json', asyncHandler(async (req, res) => {
+  const json = await kv.get('latest-report-json');
+  res.type('json').send(json || '[]');
+}));
+
+app.get('/screenshot/:id', asyncHandler(async (req, res) => {
+  const bytes = await kv.get(`screenshot-${req.params.id}`, { type: 'arrayBuffer' });
+  if (!bytes) return res.status(404).send('Screenshot not found or expired.');
+  res.set('cache-control', 'public, max-age=2592000').type('png').send(bytes);
+}));
+
+app.get('/history', asyncHandler(async (req, res) => {
+  const list = await kv.list({ prefix: 'report-' });
+  const entries = await Promise.all(
+    list.keys.map(async (k) => {
+      const ts = k.name.replace(/^report-/, '');
+      const summaryJson = await kv.get(`summary-${ts}`);
+      return { ts, summary: summaryJson ? JSON.parse(summaryJson) : null };
+    })
+  );
+  res.type('html').send(generateHistoryListHtml(entries));
+}));
+
+app.get('/history/:ts', asyncHandler(async (req, res) => {
+  const ts = decodeURIComponent(req.params.ts);
+  const json = await kv.get(`report-${ts}`);
+  if (!json) {
+    return res.status(404).send('Report not found — it may have expired (kept for ' + REPORT_HISTORY_DAYS + ' days).');
+  }
+  const html = generateHtmlReport(JSON.parse(json), ts, { isHistorical: true });
+  res.type('html').send(html);
+}));
+
+app.get('/', asyncHandler(async (req, res) => {
+  const html = await kv.get('latest-report-html');
+  if (!html) {
+    return res.send('No report yet. Visit /run to trigger the first check manually, or wait for the scheduled run.');
+  }
+  res.type('html').send(html);
+}));
+
+// Catches anything passed to next(err) by asyncHandler above — without this,
+// Express's own default error handler still responds, but this gives us a
+// clearer message and a log line pointing at what actually failed.
+app.use((err, req, res, next) => {
+  console.error('Unhandled route error:', err);
+  if (res.headersSent) return next(err);
+  res.status(500).send('Internal server error: ' + (err && err.message ? err.message : String(err)));
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Site health checker listening on :${PORT}`);
+});
+
+setupCronSchedule();
