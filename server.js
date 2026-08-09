@@ -445,24 +445,34 @@ ${BASE_STYLES}
   .vitals-meta { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--text-faint); align-self: center; }
 
   .filter-tabs {
-    display: flex; gap: 4px; padding: 14px 28px; border-bottom: 1px solid var(--border);
+    position: relative; display: inline-flex; gap: 2px; padding: 4px;
+    margin: 14px 28px; border-radius: 999px; background: rgba(255,255,255,0.05);
+    border: 1px solid var(--border);
+  }
+  .filter-slider {
+    position: absolute; top: 4px; bottom: 4px; left: 4px; border-radius: 999px;
+    background: var(--text); z-index: 0;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.35);
+    transition: transform 0.28s cubic-bezier(0.4, 0, 0.2, 1),
+                width 0.28s cubic-bezier(0.4, 0, 0.2, 1),
+                background-color 0.2s ease;
   }
   .filter-tab {
+    position: relative; z-index: 1;
     font-family: var(--mono); font-size: 12px; letter-spacing: 0.03em;
-    padding: 7px 14px; border-radius: 7px; border: 1px solid var(--border);
+    padding: 7px 16px; border-radius: 999px; border: none;
     background: transparent; color: var(--text-dim); cursor: pointer;
-    display: flex; align-items: center; gap: 7px; transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+    display: flex; align-items: center; gap: 7px;
+    transition: color 0.2s ease, transform 0.15s ease;
   }
-  .filter-tab:hover { border-color: var(--text-faint); color: var(--text); }
+  .filter-tab:hover:not(.filter-tab--active) { color: var(--text); }
+  .filter-tab:active { transform: scale(0.96); }
   .filter-tab .count {
     font-weight: 700; font-size: 11px; padding: 1px 6px; border-radius: 999px;
-    background: rgba(255,255,255,0.08); color: var(--text-dim);
+    background: rgba(255,255,255,0.1); color: inherit;
   }
-  .filter-tab--active { background: var(--text); color: var(--bg); border-color: var(--text); }
-  .filter-tab--active .count { background: rgba(0,0,0,0.15); color: var(--bg); }
-  .filter-tab--ok.filter-tab--active { background: var(--ok); border-color: var(--ok); }
-  .filter-tab--warn.filter-tab--active { background: var(--warn); border-color: var(--warn); }
-  .filter-tab--down.filter-tab--active { background: var(--down); border-color: var(--down); }
+  .filter-tab--active { color: var(--bg); }
+  .filter-tab--active .count { background: rgba(0,0,0,0.15); }
 
   .list { padding: 6px 28px 0; max-width: 920px; }
   .site-row { border-bottom: 1px solid var(--border); padding: 16px 0; }
@@ -503,25 +513,47 @@ ${BASE_STYLES}
     <div class="vital vital--down"><span class="vital-num">${downCount}</span><span class="vital-label">down</span></div>
     <div class="vitals-meta">${subtitle}</div>
   </div>
-  <div class="filter-tabs">
+  <div class="filter-tabs" id="filterTabs">
+    <div class="filter-slider" id="filterSlider"></div>
     <button type="button" class="filter-tab filter-tab--active" data-filter="ALL">All <span class="count">${okCount + issueCount + downCount}</span></button>
-    <button type="button" class="filter-tab filter-tab--ok" data-filter="OK">OK <span class="count">${okCount}</span></button>
-    <button type="button" class="filter-tab filter-tab--warn" data-filter="ISSUES">Issues <span class="count">${issueCount}</span></button>
-    <button type="button" class="filter-tab filter-tab--down" data-filter="DOWN">Down <span class="count">${downCount}</span></button>
+    <button type="button" class="filter-tab" data-filter="OK">OK <span class="count">${okCount}</span></button>
+    <button type="button" class="filter-tab" data-filter="ISSUES">Issues <span class="count">${issueCount}</span></button>
+    <button type="button" class="filter-tab" data-filter="DOWN">Down <span class="count">${downCount}</span></button>
   </div>
   <div class="list">${rows}</div>
   <script>
     (function () {
+      var track = document.getElementById('filterTabs');
+      var slider = document.getElementById('filterSlider');
       var tabs = document.querySelectorAll('.filter-tab');
       var rows = document.querySelectorAll('.site-row[data-status]');
+      var colorFor = { ALL: 'var(--text)', OK: 'var(--ok)', ISSUES: 'var(--warn)', DOWN: 'var(--down)' };
+
+      function moveSliderTo(tab) {
+        var trackRect = track.getBoundingClientRect();
+        var tabRect = tab.getBoundingClientRect();
+        slider.style.width = tabRect.width + 'px';
+        slider.style.transform = 'translateX(' + (tabRect.left - trackRect.left - 4) + 'px)';
+        slider.style.background = colorFor[tab.getAttribute('data-filter')] || 'var(--text)';
+      }
+
       tabs.forEach(function (tab) {
         tab.addEventListener('click', function () {
           var f = tab.getAttribute('data-filter');
           tabs.forEach(function (t) { t.classList.toggle('filter-tab--active', t === tab); });
+          moveSliderTo(tab);
           rows.forEach(function (row) {
             row.style.display = f === 'ALL' || row.getAttribute('data-status') === f ? '' : 'none';
           });
         });
+      });
+
+      // Position the slider under "All" instantly on load, no animation,
+      // then re-enable the transition for subsequent clicks.
+      slider.style.transition = 'none';
+      moveSliderTo(document.querySelector('.filter-tab--active'));
+      requestAnimationFrame(function () {
+        slider.style.transition = '';
       });
     })();
   </script>
