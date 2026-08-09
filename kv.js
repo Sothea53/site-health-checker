@@ -66,8 +66,16 @@ export const kv = {
   // opts: { expirationTtl: seconds }
   async put(key, value, opts = {}) {
     const col = await getCollection();
-    const isBinary = Buffer.isBuffer(value);
-    const storedValue = isBinary ? new Binary(value) : String(value);
+    // Buffer.isBuffer() returns false for a plain Uint8Array even though
+    // it's real binary data — Puppeteer's page.screenshot() can hand back
+    // a plain Uint8Array rather than a true Node Buffer depending on
+    // version. That false negative fell through to String(value), and a
+    // Uint8Array's default string conversion is a comma-separated decimal
+    // byte list — exactly the corrupted screenshot output we saw. Buffer
+    // is itself a Uint8Array subclass, so `instanceof Uint8Array` correctly
+    // catches both real Buffers and plain Uint8Arrays as binary.
+    const isBinary = value instanceof Uint8Array;
+    const storedValue = isBinary ? new Binary(Buffer.from(value)) : String(value);
 
     const setFields = { value: storedValue };
     const unsetFields = {};
