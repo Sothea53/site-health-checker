@@ -117,15 +117,31 @@ async function performPageChecks(page, url, vp, result) {
   result.brokenImages = brokenImages;
 
   diag(`overflow evaluate start`, url);
-  const overflow = await page.evaluate(() => {
-    const docWidth = document.documentElement.scrollWidth;
-    const viewWidth = document.documentElement.clientWidth;
-    return { docWidth, viewWidth };
-  });
-  diag(`overflow evaluate done`, url);
-  result.hasOverflow = overflow.docWidth > overflow.viewWidth + OVERFLOW_TOLERANCE_PX;
+  // Sample overflow multiple times rather than once — a single snapshot can
+  // land mid-animation (a sliding carousel, an opening menu, a marquee) and
+  // catch a transient state that's briefly wider than the viewport even
+  // though the page settles back to a clean layout moments later. Only
+  // flag it as a real issue if overflow is present in every sample, so a
+  // genuinely broken layout still gets caught but a passing animation frame
+  // doesn't produce a false positive.
+  const OVERFLOW_SAMPLES = 3;
+  const OVERFLOW_SAMPLE_INTERVAL_MS = 400;
+  const overflowSamples = [];
+  for (let sample = 0; sample < OVERFLOW_SAMPLES; sample++) {
+    const reading = await page.evaluate(() => ({
+      docWidth: document.documentElement.scrollWidth,
+      viewWidth: document.documentElement.clientWidth,
+    }));
+    overflowSamples.push(reading);
+    if (sample < OVERFLOW_SAMPLES - 1) {
+      await new Promise((resolve) => setTimeout(resolve, OVERFLOW_SAMPLE_INTERVAL_MS));
+    }
+  }
+  diag(`overflow evaluate done`, `${url} samples=${JSON.stringify(overflowSamples)}`);
+  result.hasOverflow = overflowSamples.every((s) => s.docWidth > s.viewWidth + OVERFLOW_TOLERANCE_PX);
   if (result.hasOverflow) {
-    result.issues.push(`Horizontal overflow: page is ${overflow.docWidth}px wide in a ${overflow.viewWidth}px viewport`);
+    const worst = overflowSamples.reduce((a, b) => (b.docWidth > a.docWidth ? b : a));
+    result.issues.push(`Horizontal overflow: page is ${worst.docWidth}px wide in a ${worst.viewWidth}px viewport (consistent across ${OVERFLOW_SAMPLES} samples)`);
   }
 
   if (brokenImages.length > 0) result.issues.push(`${brokenImages.length} broken image(s)`);
@@ -368,7 +384,7 @@ function generateHtmlReport(results, timestampIso, options = {}) {
           if (e.screenshotId) {
             details.push(`
               <details class="detail">
-                <summary>Screenshot</summary>
+                <summary>Screenshot <a class="shot-open" href="/screenshot/${e.screenshotId}" target="_blank" rel="noopener" title="Open full screenshot in a new tab" onclick="event.stopPropagation()">&#8599; open</a></summary>
                 <div class="detail-body"><img class="detail-shot" loading="lazy" src="/screenshot/${e.screenshotId}" /></div>
               </details>`);
           }
@@ -387,7 +403,7 @@ function generateHtmlReport(results, timestampIso, options = {}) {
         .join('');
 
       return `
-        <div class="site-row">
+        <div class="site-row" data-status="${worst}">
           <div class="site-head">
             <span class="dot dot--${worstClass}"></span>
             <a class="site-url" href="${siteUrl}" target="_blank">${escapeHtml(siteUrl)}</a>
@@ -420,13 +436,20 @@ ${BASE_STYLES}
     display: flex; gap: 30px; align-items: baseline; flex-wrap: wrap;
     padding: 26px 28px 20px; border-bottom: 1px solid var(--border);
   }
-  .vital { display: flex; align-items: baseline; gap: 8px; }
+  .vital {
+    display: flex; align-items: baseline; gap: 8px; cursor: pointer;
+    padding: 4px 10px; margin: -4px -10px; border-radius: 6px;
+    border: 1px solid transparent; transition: background 0.12s ease, border-color 0.12s ease;
+  }
+  .vital:hover { background: rgba(255,255,255,0.04); }
+  .vital--active { border-color: var(--border); background: rgba(255,255,255,0.06); }
   .vital-num { font-family: var(--mono); font-size: 30px; font-weight: 700; }
   .vital-label { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-dim); }
   .vital--ok .vital-num { color: var(--ok); }
   .vital--warn .vital-num { color: var(--warn); }
   .vital--down .vital-num { color: var(--down); }
   .vitals-meta { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--text-faint); align-self: center; }
+  .filter-hint { color: var(--accent); }
 
   .list { padding: 6px 28px 0; max-width: 920px; }
   .site-row { border-bottom: 1px solid var(--border); padding: 16px 0; }
@@ -455,17 +478,46 @@ ${BASE_STYLES}
   .detail-list a { color: var(--text-dim); }
   .detail-list a:hover { color: var(--accent); }
   .detail-shot { max-width: 100%; margin-top: 6px; border: 1px solid var(--border); border-radius: 6px; display: block; }
+  .shot-open { color: var(--accent); text-decoration: none; font-size: 11px; margin-left: 4px; }
+  .shot-open:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
   ${topbar('latest')}
   <div class="vitals">
-    <div class="vital vital--ok"><span class="vital-num">${okCount}</span><span class="vital-label">up</span></div>
-    <div class="vital vital--warn"><span class="vital-num">${issueCount}</span><span class="vital-label">issues</span></div>
-    <div class="vital vital--down"><span class="vital-num">${downCount}</span><span class="vital-label">down</span></div>
-    <div class="vitals-meta">${subtitle}</div>
+    <div class="vital vital--ok" data-filter="OK" role="button" tabindex="0"><span class="vital-num">${okCount}</span><span class="vital-label">up</span></div>
+    <div class="vital vital--warn" data-filter="ISSUES" role="button" tabindex="0"><span class="vital-num">${issueCount}</span><span class="vital-label">issues</span></div>
+    <div class="vital vital--down" data-filter="DOWN" role="button" tabindex="0"><span class="vital-num">${downCount}</span><span class="vital-label">down</span></div>
+    <div class="vitals-meta">${subtitle}<span class="filter-hint" style="display:none">&nbsp;&middot; filtered, click again to clear</span></div>
   </div>
   <div class="list">${rows}</div>
+  <script>
+    (function () {
+      var vitals = document.querySelectorAll('.vital[data-filter]');
+      var rows = document.querySelectorAll('.site-row[data-status]');
+      var hint = document.querySelector('.filter-hint');
+      var active = null;
+      function apply() {
+        vitals.forEach(function (v) {
+          v.classList.toggle('vital--active', v.getAttribute('data-filter') === active);
+        });
+        rows.forEach(function (row) {
+          row.style.display = !active || row.getAttribute('data-status') === active ? '' : 'none';
+        });
+        if (hint) hint.style.display = active ? 'inline' : 'none';
+      }
+      vitals.forEach(function (v) {
+        v.addEventListener('click', function () {
+          var f = v.getAttribute('data-filter');
+          active = active === f ? null : f;
+          apply();
+        });
+        v.addEventListener('keydown', function (ev) {
+          if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); v.click(); }
+        });
+      });
+    })();
+  </script>
 </body>
 </html>`;
 }
