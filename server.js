@@ -436,20 +436,33 @@ ${BASE_STYLES}
     display: flex; gap: 30px; align-items: baseline; flex-wrap: wrap;
     padding: 26px 28px 20px; border-bottom: 1px solid var(--border);
   }
-  .vital {
-    display: flex; align-items: baseline; gap: 8px; cursor: pointer;
-    padding: 4px 10px; margin: -4px -10px; border-radius: 6px;
-    border: 1px solid transparent; transition: background 0.12s ease, border-color 0.12s ease;
-  }
-  .vital:hover { background: rgba(255,255,255,0.04); }
-  .vital--active { border-color: var(--border); background: rgba(255,255,255,0.06); }
+  .vital { display: flex; align-items: baseline; gap: 8px; }
   .vital-num { font-family: var(--mono); font-size: 30px; font-weight: 700; }
   .vital-label { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-dim); }
   .vital--ok .vital-num { color: var(--ok); }
   .vital--warn .vital-num { color: var(--warn); }
   .vital--down .vital-num { color: var(--down); }
   .vitals-meta { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--text-faint); align-self: center; }
-  .filter-hint { color: var(--accent); }
+
+  .filter-tabs {
+    display: flex; gap: 4px; padding: 14px 28px; border-bottom: 1px solid var(--border);
+  }
+  .filter-tab {
+    font-family: var(--mono); font-size: 12px; letter-spacing: 0.03em;
+    padding: 7px 14px; border-radius: 7px; border: 1px solid var(--border);
+    background: transparent; color: var(--text-dim); cursor: pointer;
+    display: flex; align-items: center; gap: 7px; transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+  }
+  .filter-tab:hover { border-color: var(--text-faint); color: var(--text); }
+  .filter-tab .count {
+    font-weight: 700; font-size: 11px; padding: 1px 6px; border-radius: 999px;
+    background: rgba(255,255,255,0.08); color: var(--text-dim);
+  }
+  .filter-tab--active { background: var(--text); color: var(--bg); border-color: var(--text); }
+  .filter-tab--active .count { background: rgba(0,0,0,0.15); color: var(--bg); }
+  .filter-tab--ok.filter-tab--active { background: var(--ok); border-color: var(--ok); }
+  .filter-tab--warn.filter-tab--active { background: var(--warn); border-color: var(--warn); }
+  .filter-tab--down.filter-tab--active { background: var(--down); border-color: var(--down); }
 
   .list { padding: 6px 28px 0; max-width: 920px; }
   .site-row { border-bottom: 1px solid var(--border); padding: 16px 0; }
@@ -485,35 +498,29 @@ ${BASE_STYLES}
 <body>
   ${topbar('latest')}
   <div class="vitals">
-    <div class="vital vital--ok" data-filter="OK" role="button" tabindex="0"><span class="vital-num">${okCount}</span><span class="vital-label">up</span></div>
-    <div class="vital vital--warn" data-filter="ISSUES" role="button" tabindex="0"><span class="vital-num">${issueCount}</span><span class="vital-label">issues</span></div>
-    <div class="vital vital--down" data-filter="DOWN" role="button" tabindex="0"><span class="vital-num">${downCount}</span><span class="vital-label">down</span></div>
-    <div class="vitals-meta">${subtitle}<span class="filter-hint" style="display:none">&nbsp;&middot; filtered, click again to clear</span></div>
+    <div class="vital vital--ok"><span class="vital-num">${okCount}</span><span class="vital-label">up</span></div>
+    <div class="vital vital--warn"><span class="vital-num">${issueCount}</span><span class="vital-label">issues</span></div>
+    <div class="vital vital--down"><span class="vital-num">${downCount}</span><span class="vital-label">down</span></div>
+    <div class="vitals-meta">${subtitle}</div>
+  </div>
+  <div class="filter-tabs">
+    <button type="button" class="filter-tab filter-tab--active" data-filter="ALL">All <span class="count">${okCount + issueCount + downCount}</span></button>
+    <button type="button" class="filter-tab filter-tab--ok" data-filter="OK">OK <span class="count">${okCount}</span></button>
+    <button type="button" class="filter-tab filter-tab--warn" data-filter="ISSUES">Issues <span class="count">${issueCount}</span></button>
+    <button type="button" class="filter-tab filter-tab--down" data-filter="DOWN">Down <span class="count">${downCount}</span></button>
   </div>
   <div class="list">${rows}</div>
   <script>
     (function () {
-      var vitals = document.querySelectorAll('.vital[data-filter]');
+      var tabs = document.querySelectorAll('.filter-tab');
       var rows = document.querySelectorAll('.site-row[data-status]');
-      var hint = document.querySelector('.filter-hint');
-      var active = null;
-      function apply() {
-        vitals.forEach(function (v) {
-          v.classList.toggle('vital--active', v.getAttribute('data-filter') === active);
-        });
-        rows.forEach(function (row) {
-          row.style.display = !active || row.getAttribute('data-status') === active ? '' : 'none';
-        });
-        if (hint) hint.style.display = active ? 'inline' : 'none';
-      }
-      vitals.forEach(function (v) {
-        v.addEventListener('click', function () {
-          var f = v.getAttribute('data-filter');
-          active = active === f ? null : f;
-          apply();
-        });
-        v.addEventListener('keydown', function (ev) {
-          if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); v.click(); }
+      tabs.forEach(function (tab) {
+        tab.addEventListener('click', function () {
+          var f = tab.getAttribute('data-filter');
+          tabs.forEach(function (t) { t.classList.toggle('filter-tab--active', t === tab); });
+          rows.forEach(function (row) {
+            row.style.display = f === 'ALL' || row.getAttribute('data-status') === f ? '' : 'none';
+          });
         });
       });
     })();
