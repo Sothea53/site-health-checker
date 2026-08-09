@@ -317,6 +317,7 @@ function topbar(activeNav) {
     <div class="nav">
       <a href="/" ${activeNav === 'latest' ? 'style="color:var(--accent)"' : ''}>Latest</a>
       <a href="/history" ${activeNav === 'history' ? 'style="color:var(--accent)"' : ''}>History</a>
+      <a href="/settings" ${activeNav === 'settings' ? 'style="color:var(--accent)"' : ''}>Settings</a>
       <a href="/run" class="check-now">Check Now</a>
     </div>
   </div>`;
@@ -614,6 +615,137 @@ ${BASE_STYLES}
 </html>`;
 }
 
+function generateSettingsPageHtml(settings, flash) {
+  const flashHtml = flash
+    ? `<div class="flash flash--${flash.type}">${escapeHtml(flash.message)}</div>`
+    : '';
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Site Health — Settings</title>
+<style>
+${BASE_STYLES}
+  .settings-wrap { max-width: 620px; margin: 0 auto; padding: 32px 28px 60px; }
+  .settings-title { font-size: 20px; font-weight: 700; margin: 0 0 6px; }
+  .settings-subtitle { color: var(--text-dim); font-size: 13px; margin: 0 0 28px; }
+  .settings-card {
+    border: 1px solid var(--border); border-radius: 10px; padding: 24px;
+    margin-bottom: 20px; background: rgba(255,255,255,0.015);
+  }
+  .settings-card h2 {
+    font-size: 14px; margin: 0 0 4px; display: flex; align-items: center; gap: 8px;
+  }
+  .settings-card .card-desc { color: var(--text-dim); font-size: 12.5px; margin: 0 0 20px; }
+  .field { margin-bottom: 18px; }
+  .field label {
+    display: flex; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 600;
+    margin-bottom: 6px; color: var(--text);
+  }
+  .field input[type="text"], .field input[type="password"] {
+    width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 7px;
+    padding: 9px 12px; color: var(--text); font-family: var(--mono); font-size: 13px;
+  }
+  .field input:focus { outline: none; border-color: var(--accent); }
+  .field .help {
+    color: var(--text-faint); font-size: 11.5px; margin-top: 6px; line-height: 1.5;
+  }
+  .field .help code {
+    background: rgba(255,255,255,0.06); padding: 1px 5px; border-radius: 4px; font-size: 11px;
+  }
+  .toggle-row { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+  .toggle-row label { font-size: 13px; font-weight: 600; margin: 0; cursor: pointer; }
+  .switch { position: relative; width: 38px; height: 22px; flex-shrink: 0; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .track {
+    position: absolute; inset: 0; background: var(--border); border-radius: 999px;
+    cursor: pointer; transition: background 0.15s ease;
+  }
+  .switch .track::before {
+    content: ''; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px;
+    background: var(--text-dim); border-radius: 50%; transition: transform 0.15s ease, background 0.15s ease;
+  }
+  .switch input:checked + .track { background: rgba(63,185,80,0.25); }
+  .switch input:checked + .track::before { transform: translateX(16px); background: var(--ok); }
+  .btn-row { display: flex; gap: 10px; margin-top: 4px; }
+  .btn {
+    font-family: var(--mono); font-size: 12.5px; font-weight: 600; letter-spacing: 0.02em;
+    padding: 9px 16px; border-radius: 7px; border: 1px solid var(--border);
+    background: transparent; color: var(--text); cursor: pointer;
+  }
+  .btn:hover { border-color: var(--text-faint); }
+  .btn--primary { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+  .btn--primary:hover { opacity: 0.9; border-color: var(--accent); }
+  .flash {
+    padding: 11px 16px; border-radius: 8px; font-size: 12.5px; margin-bottom: 20px;
+    font-family: var(--mono);
+  }
+  .flash--ok { background: rgba(63,185,80,0.12); color: var(--ok); border: 1px solid rgba(63,185,80,0.3); }
+  .flash--error { background: rgba(248,81,73,0.12); color: var(--down); border: 1px solid rgba(248,81,73,0.3); }
+  .alert-note {
+    font-size: 11.5px; color: var(--text-faint); margin-top: -8px; margin-bottom: 18px;
+    padding: 8px 12px; background: rgba(255,255,255,0.03); border-radius: 6px;
+  }
+</style>
+</head>
+<body>
+  ${topbar('settings')}
+  <div class="settings-wrap">
+    <h1 class="settings-title">Settings</h1>
+    <p class="settings-subtitle">Configure alerts and other options for this checker.</p>
+
+    ${flashHtml}
+
+    <div class="settings-card">
+      <h2>📨 Telegram Alerts</h2>
+      <p class="card-desc">Sends a Telegram message the moment a site transitions into DOWN. Won't re-alert every run while it stays down, and won't alert on ISSUES or recovery — just the moment something breaks.</p>
+
+      <form method="POST" action="/settings">
+        <div class="toggle-row">
+          <span class="switch">
+            <input type="checkbox" id="telegramEnabled" name="telegramEnabled" ${settings.telegramEnabled ? 'checked' : ''} />
+            <span class="track" onclick="document.getElementById('telegramEnabled').click()"></span>
+          </span>
+          <label for="telegramEnabled">Enable Telegram alerts</label>
+        </div>
+
+        <div class="field">
+          <label for="telegramBotToken">Bot Token</label>
+          <input type="password" id="telegramBotToken" name="telegramBotToken" value="${escapeHtml(settings.telegramBotToken)}" placeholder="123456789:AAExampleTokenFromBotFather" autocomplete="off" />
+          <div class="help">
+            Get this from <a href="https://t.me/BotFather" target="_blank">@BotFather</a> on Telegram: send <code>/newbot</code>, follow the prompts, and it'll give you a token that looks like <code>123456789:AAH...</code>.
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="telegramChatId">Chat ID</label>
+          <input type="text" id="telegramChatId" name="telegramChatId" value="${escapeHtml(settings.telegramChatId)}" placeholder="e.g. 123456789" autocomplete="off" />
+          <div class="help">
+            How to find your chat ID: first send any message to your new bot (search for it by the username BotFather gave you, and press Start). Then open
+            <code>https://api.telegram.org/bot&lt;YOUR_TOKEN&gt;/getUpdates</code>
+            in a browser — replace <code>&lt;YOUR_TOKEN&gt;</code> with the bot token above. Look for <code>"chat":{"id":123456789,...}</code> in the response — that number is your chat ID.
+            <br />For a group chat instead, add the bot to the group first, send a message there, then check the same URL — group chat IDs are usually negative numbers.
+          </div>
+        </div>
+
+        <div class="btn-row">
+          <button type="submit" class="btn btn--primary">Save Settings</button>
+        </div>
+      </form>
+
+      <form method="POST" action="/settings/test-telegram" style="margin-top: 14px;">
+        <div class="btn-row">
+          <button type="submit" class="btn">Send Test Alert</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
 function generateRunningPageHtml() {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -854,6 +986,18 @@ async function runChecksInner( progress, totalChecks) {
     { expirationTtl: 60 * 60 * 24 * REPORT_HISTORY_DAYS }
   );
 
+  // Per-site worst status, for diffing against the previous run to detect
+  // DOWN transitions (see checkForDownAlerts).
+  const siteStatusMap = {};
+  for (const [siteUrl, entries] of Object.entries(bySite)) {
+    siteStatusMap[siteUrl] = entries.some((e) => e.status === 'DOWN')
+      ? 'DOWN'
+      : entries.some((e) => e.status === 'ISSUES')
+      ? 'ISSUES'
+      : 'OK';
+  }
+  await checkForDownAlerts(siteStatusMap);
+
   const html = generateHtmlReport(results, timestampIso);
 
   await kv.put('latest-report-html', html);
@@ -887,7 +1031,87 @@ function setupCronSchedule() {
   console.log(`Scheduled daily check: "${schedule}" (${timezone})`);
 }
 
+// ---- Settings (Telegram alerts) ----
+
+const DEFAULT_SETTINGS = {
+  telegramEnabled: false,
+  telegramBotToken: '',
+  telegramChatId: '',
+};
+
+async function getSettings() {
+  const raw = await kv.get('settings');
+  if (!raw) return { ...DEFAULT_SETTINGS };
+  try {
+    return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+  } catch {
+    return { ...DEFAULT_SETTINGS };
+  }
+}
+
+async function saveSettings(partial) {
+  const merged = { ...(await getSettings()), ...partial };
+  await kv.put('settings', JSON.stringify(merged));
+  return merged;
+}
+
+async function sendTelegramMessage(settings, text) {
+  if (!settings.telegramBotToken || !settings.telegramChatId) {
+    throw new Error('Telegram bot token and chat ID must both be set');
+  }
+  const url = `https://api.telegram.org/bot${settings.telegramBotToken}/sendMessage`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ chat_id: settings.telegramChatId, text }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok === false) {
+    throw new Error(data.description || `Telegram API returned HTTP ${res.status}`);
+  }
+  return data;
+}
+
+// Alerts fire only on a site transitioning INTO 'DOWN' (not on every check
+// while it stays down, and not on ISSUES/recovery — per what was asked for).
+// Detecting a "transition" requires comparing against the previous run's
+// per-site status, so we persist that map across runs. On the very first
+// run ever (no previous map), nothing is alerted — that's a baseline being
+// established, not a new failure, so it shouldn't page anyone.
+async function checkForDownAlerts(siteStatusMap) {
+  try {
+    const settings = await getSettings();
+    const prevRaw = await kv.get('previous-site-status');
+    const prevMap = prevRaw ? JSON.parse(prevRaw) : null;
+
+    if (prevMap && settings.telegramEnabled && settings.telegramBotToken && settings.telegramChatId) {
+      for (const [siteUrl, status] of Object.entries(siteStatusMap)) {
+        const prevStatus = prevMap[siteUrl];
+        if (status === 'DOWN' && prevStatus !== 'DOWN') {
+          const text = `🔴 DOWN: ${siteUrl}\n\nJust started failing health checks.`;
+          try {
+            await sendTelegramMessage(settings, text);
+            diag('Telegram alert sent', siteUrl);
+          } catch (err) {
+            // Don't let a Telegram API failure (bad token, network blip, etc.)
+            // interrupt the run itself — just log it.
+            diag('Telegram alert failed', `${siteUrl}: ${String(err && err.message ? err.message : err)}`);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    diag('checkForDownAlerts error', String(err && err.message ? err.message : err));
+  } finally {
+    // Persist regardless of whether alerting is even enabled, so that
+    // turning alerts on later immediately has a correct baseline to diff
+    // against instead of alerting on everything already down at that point.
+    await kv.put('previous-site-status', JSON.stringify(siteStatusMap));
+  }
+}
+
 const app = express();
+app.use(express.urlencoded({ extended: false }));
 
 // Express 4 does NOT automatically catch rejections from async route
 // handlers — an unhandled rejection here just leaves the request hanging
@@ -951,6 +1175,34 @@ app.get('/history', asyncHandler(async (req, res) => {
     })
   );
   res.type('html').send(generateHistoryListHtml(entries));
+}));
+
+app.get('/settings', asyncHandler(async (req, res) => {
+  const settings = await getSettings();
+  let flash = null;
+  if (req.query.saved) flash = { type: 'ok', message: 'Settings saved.' };
+  if (req.query.test === 'ok') flash = { type: 'ok', message: 'Test alert sent — check Telegram.' };
+  if (req.query.test === 'error') flash = { type: 'error', message: `Test alert failed: ${req.query.msg || 'unknown error'}` };
+  res.type('html').send(generateSettingsPageHtml(settings, flash));
+}));
+
+app.post('/settings', asyncHandler(async (req, res) => {
+  await saveSettings({
+    telegramEnabled: req.body.telegramEnabled === 'on',
+    telegramBotToken: (req.body.telegramBotToken || '').trim(),
+    telegramChatId: (req.body.telegramChatId || '').trim(),
+  });
+  res.redirect('/settings?saved=1');
+}));
+
+app.post('/settings/test-telegram', asyncHandler(async (req, res) => {
+  const settings = await getSettings();
+  try {
+    await sendTelegramMessage(settings, '✅ Test alert from Site Health — Telegram alerts are wired up correctly.');
+    res.redirect('/settings?test=ok');
+  } catch (err) {
+    res.redirect('/settings?test=error&msg=' + encodeURIComponent(String(err && err.message ? err.message : err)));
+  }
 }));
 
 app.get('/history/:ts', asyncHandler(async (req, res) => {
