@@ -48,7 +48,15 @@ export const kv = {
     const doc = await col.findOne({ _id: key });
     if (!doc) return null;
 
-    const isBinary = doc.value instanceof Binary;
+    // Duck-type via _bsontype rather than `instanceof Binary` — if the
+    // mongodb driver bundles its own internal copy of the bson package
+    // (common with nested npm dependency trees), our imported Binary class
+    // can be a different reference than the one actually used to construct
+    // this value, silently failing instanceof even though it IS binary
+    // data. That failure mode is exactly what corrupted screenshots: it
+    // fell through to treating raw image bytes as a string, producing a
+    // garbled byte-array text dump instead of a real image.
+    const isBinary = !!(doc.value && doc.value._bsontype === 'Binary');
     if (opts.type === 'arrayBuffer') {
       return isBinary ? Buffer.from(doc.value.buffer) : Buffer.from(String(doc.value), 'utf-8');
     }
