@@ -137,7 +137,13 @@ async function performPageChecks(page, url, vp, result) {
   // Only screenshot pages with an issue, to stay well within the Free plan's 10 min/day browser budget
   if (result.issues.length > 0) {
     diag(`screenshot start`, url);
-    result.screenshotBytes = await page.screenshot({ fullPage: true });
+    // JPEG instead of PNG: full-page PNGs of real websites can run several
+    // MB (a plain lossless capture hit ~7MB on one page), large enough to
+    // trip nginx's default proxy buffering/timeout and render as a broken
+    // image in the browser even though the data was stored correctly.
+    // Quality 70 keeps it plenty sharp for spotting overflow/broken elements
+    // while typically landing well under 1MB.
+    result.screenshotBytes = await page.screenshot({ fullPage: true, type: 'jpeg', quality: 70 });
     diag(`screenshot done`, url);
   }
   diag(`performPageChecks complete`, url);
@@ -837,7 +843,11 @@ app.get('/report.json', asyncHandler(async (req, res) => {
 app.get('/screenshot/:id', asyncHandler(async (req, res) => {
   const bytes = await kv.get(`screenshot-${req.params.id}`, { type: 'arrayBuffer' });
   if (!bytes) return res.status(404).send('Screenshot not found or expired.');
-  res.set('cache-control', 'public, max-age=2592000').type('png').send(bytes);
+  // Sniff the actual format rather than assuming JPEG — older entries stored
+  // before this switch are still raw PNG bytes, and serving those with a
+  // jpeg Content-Type would just trade one broken-image cause for another.
+  const isPng = bytes.length > 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47;
+  res.set('cache-control', 'public, max-age=2592000').type(isPng ? 'png' : 'jpeg').send(bytes);
 }));
 
 app.get('/history', asyncHandler(async (req, res) => {
