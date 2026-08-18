@@ -64,7 +64,7 @@ shell):
 
 ```bash
 npm install -g pm2   # if not already installed
-pm2 start ecosystem.config.js
+pm2 start ecosystem.config.cjs
 pm2 save              # persist the process list
 pm2 startup           # prints a command to run so PM2 survives a reboot — run it
 ```
@@ -122,6 +122,6 @@ Then run `certbot --nginx` (or Caddy's automatic HTTPS) for TLS.
 
 - `server.js` — the whole app (routes, checks, HTML generation, cron)
 - `kv.js` — MongoDB-backed KV shim
-- `ecosystem.config.js` — PM2 process config (only needed if you're not
+- `ecosystem.config.cjs` — PM2 process config (only needed if you're not
   using ServerAvatar's own process management)
 - `package.json` — dependencies
