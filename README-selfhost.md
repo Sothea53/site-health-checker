@@ -64,7 +64,7 @@ shell):
 
 ```bash
 npm install -g pm2   # if not already installed
-pm2 start ecosystem.config.js
+pm2 start ecosystem.config.cjs
 pm2 save              # persist the process list
 pm2 startup           # prints a command to run so PM2 survives a reboot — run it
 ```
@@ -114,6 +114,10 @@ Then run `certbot --nginx` (or Caddy's automatic HTTPS) for TLS.
   (e.g. Mongo unreachable) returns a real error response instead of hanging
   the request indefinitely — the same silent-hang failure mode debugged at
   length on the Cloudflare version, worth avoiding here too.
+- **Availability checks**: Navigation now waits for `domcontentloaded` rather
+  than full network idle, matching uptime monitors more closely and avoiding
+  false DOWN results on pages that keep analytics, chat widgets, or long-polling
+  requests open after the HTML has successfully loaded.
 - No more Free-plan limits — 10 min/day browser budget and 2–3 concurrent
   session caps are gone. The overlap-guard and retry-with-backoff logic
   were kept anyway as general good practice for a long-running process.
@@ -122,6 +126,6 @@ Then run `certbot --nginx` (or Caddy's automatic HTTPS) for TLS.
 
 - `server.js` — the whole app (routes, checks, HTML generation, cron)
 - `kv.js` — MongoDB-backed KV shim
-- `ecosystem.config.js` — PM2 process config (only needed if you're not
+- `ecosystem.config.cjs` — PM2 process config (only needed if you're not
   using ServerAvatar's own process management)
 - `package.json` — dependencies

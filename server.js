@@ -29,6 +29,12 @@ const VIEWPORTS = {
 
 const OVERFLOW_TOLERANCE_PX = 5;
 const NAV_TIMEOUT_MS = 25000;
+// Treat the site as reachable once the initial HTML is parsed. Waiting for
+// `networkidle0` makes this checker stricter than uptime tools such as
+// Uptime Kuma and falsely marks pages DOWN when analytics, chat widgets,
+// beacons, or long-polling requests keep the network busy.
+const NAV_WAIT_UNTIL = 'domcontentloaded';
+const CONTENT_READY_DELAY_MS = 1000;
 const REPORT_HISTORY_DAYS = 30;
 const SETTLE_DELAY_MS = 4000; // wait after scrolling, before checking images/overflow/screenshot
 
@@ -44,7 +50,7 @@ function diag(label, extra) {
 
 // Hard ceiling for an entire single-page check (nav + scroll + settle + checks + screenshot).
 // Guards against any single site hanging the whole batch, no matter what causes it.
-const PAGE_TIMEOUT_MS = NAV_TIMEOUT_MS + SETTLE_DELAY_MS + 15000;
+const PAGE_TIMEOUT_MS = NAV_TIMEOUT_MS + CONTENT_READY_DELAY_MS + SETTLE_DELAY_MS + 15000;
 
 async function performPageChecks(page, url, vp, result) {
   diag(`setViewport start`, url);
@@ -67,8 +73,10 @@ async function performPageChecks(page, url, vp, result) {
 
   const start = Date.now();
   diag(`goto start`, url);
-  const response = await page.goto(url, { waitUntil: 'networkidle0', timeout: NAV_TIMEOUT_MS });
-  diag(`goto done`, `${url} status=${response ? response.status() : 'null'}`);
+  const response = await page.goto(url, { waitUntil: NAV_WAIT_UNTIL, timeout: NAV_TIMEOUT_MS });
+  diag(`goto done`, `${url} status=${response ? response.status() : 'null'} waitUntil=${NAV_WAIT_UNTIL}`);
+  await new Promise((resolve) => setTimeout(resolve, CONTENT_READY_DELAY_MS));
+  diag(`content ready delay done`, url);
   result.loadTimeMs = Date.now() - start;
   result.httpStatus = response ? response.status() : null;
 
